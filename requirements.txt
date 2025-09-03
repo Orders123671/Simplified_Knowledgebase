@@ -1,0 +1,11 @@
+streamlit
+google-cloud-firestore
+firebase-admin
+pypdf
+Pillow
+pytesseract
+pandas
+sentence-transformers
+torch
+google-generativeai
+openpyxl
