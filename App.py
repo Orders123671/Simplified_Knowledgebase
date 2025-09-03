@@ -15,6 +15,7 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import torch
 import numpy as np
+import json
 
 # --- UI Layout ---
 st.set_page_config(page_title="Katrina Knowledgebase", layout="wide")
@@ -35,15 +36,17 @@ try:
     if not firebase_admin._apps:
         credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         if credentials_path:
-            cred = credentials.Certificate(credentials_path)
-            firebase_admin.initialize_app(cred)
+            with open(credentials_path) as f:
+                cred_info = json.load(f)
+            cred = credentials.Certificate(cred_info)
+            firebase_admin.initialize_app(cred, {'projectId': cred_info['project_id']})
         else:
             cred = google.auth.default()[0]
             firebase_admin.initialize_app(cred)
     db = fa_firestore.client()
 except Exception as e:
     st.error(f"Error initializing Firestore: {e}")
-    st.warning("Please ensure you have set up your Google Cloud service account key and the GOOGLE_APPLICATION_CREDENTIALS environment variable.")
+    st.warning("Please ensure you have set up your Google Cloud service account key and the GOOGLE_APPLICATION_PROJECT environment variable.")
     st.stop()
 
 # --- Gemini API and Embeddings Model Initialization ---
@@ -74,6 +77,10 @@ def extract_text_from_pdf(pdf_file):
     return text
 
 def extract_text_from_image(image_file):
+    # Set the path to the Tesseract executable
+    if 'TESSERACT_CMD' in os.environ:
+        pytesseract.pytesseract.tesseract_cmd = os.environ['TESSERACT_CMD']
+    
     try:
         image = Image.open(image_file)
         text = pytesseract.image_to_string(image)
