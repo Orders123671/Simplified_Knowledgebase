@@ -34,19 +34,18 @@ st.markdown("""
 # --- Firestore Initialization ---
 try:
     if not firebase_admin._apps:
-        credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if credentials_path:
-            with open(credentials_path) as f:
-                cred_info = json.load(f)
+        # Most reliable method: use a service account key from secrets
+        if "firebase_credentials" in st.secrets:
+            cred_info = json.loads(st.secrets["firebase_credentials"])
             cred = credentials.Certificate(cred_info)
             firebase_admin.initialize_app(cred, {'projectId': cred_info['project_id']})
         else:
-            cred = google.auth.default()[0]
-            firebase_admin.initialize_app(cred)
+            st.error("Firebase credentials not found in `.streamlit/secrets.toml`.")
+            st.stop()
     db = fa_firestore.client()
 except Exception as e:
     st.error(f"Error initializing Firestore: {e}")
-    st.warning("Please ensure you have set up your Google Cloud service account key and the GOOGLE_APPLICATION_PROJECT environment variable.")
+    st.warning("Please ensure your Firestore credentials are correctly set up in `.streamlit/secrets.toml`.")
     st.stop()
 
 # --- Gemini API and Embeddings Model Initialization ---
