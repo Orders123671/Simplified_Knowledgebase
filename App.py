@@ -43,61 +43,58 @@ st.markdown("""
 @st.cache_resource
 def init_services():
     """
-    Initializes and caches connections to all backend services (Firestore, Vertex AI, Gemini).
-    This function runs only once per session, dramatically speeding up the app.
+    Initializes and caches connections to all backend services. This function uses a robust
+    authentication method that works for both local development and Streamlit Cloud deployment.
     """
-    # --- Firestore Initialization ---
     try:
-        if not firebase_admin._apps:
-            if os.path.exists("serviceAccountKey.json"):
-                cred_obj_for_firebase = credentials.Certificate("serviceAccountKey.json")
-                firebase_admin.initialize_app(cred_obj_for_firebase)
-            elif "firebase" in st.secrets:
-                firebase_creds = st.secrets["firebase"]
-                if isinstance(firebase_creds, str):
-                    firebase_creds_dict = ast.literal_eval(firebase_creds)
-                else:
-                    firebase_creds_dict = dict(firebase_creds)
-                cred_obj_for_firebase = credentials.Certificate(firebase_creds_dict)
-                firebase_admin.initialize_app(cred_obj_for_firebase)
+        # --- Unified Credential Handling for Deployment ---
+        cred_path = "gcp_creds.json"
+        if os.path.exists("serviceAccountKey.json"):
+            # Use local key file if it exists
+            cred_path = "serviceAccountKey.json"
+        elif "firebase" in st.secrets:
+            # Otherwise, use secrets and write to a temporary file for cloud deployment
+            firebase_creds = st.secrets["firebase"]
+            if isinstance(firebase_creds, str):
+                creds_dict = ast.literal_eval(firebase_creds)
             else:
-                st.error("Error initializing Firestore: No credentials found.")
-                st.stop()
-        db = fa_firestore.client()
-    except Exception as e:
-        st.error(f"Error initializing Firestore: {e}")
-        st.stop()
+                creds_dict = dict(firebase_creds)
+            with open(cred_path, "w") as f:
+                json.dump(creds_dict, f)
+        else:
+            st.error("Error: No Google Cloud credentials found.")
+            st.stop()
+        
+        # Set the environment variable for Google Cloud libraries
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
-    # --- Vertex AI Vector Search Initialization ---
-    try:
+        # --- Firestore Initialization ---
+        if not firebase_admin._apps:
+            cred_obj_for_firebase = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred_obj_for_firebase)
+        db = fa_firestore.client()
+
+        # --- Vertex AI Vector Search Initialization ---
         gcp_project_id = st.secrets["GCP_PROJECT_ID"]
         gcp_region = st.secrets["GCP_REGION"]
         vertex_ai_index_id = st.secrets["VERTEX_AI_INDEX_ID"]
         vertex_ai_endpoint_id = st.secrets["VERTEX_AI_ENDPOINT_ID"]
         if "VERTEX_AI_DEPLOYED_INDEX_ID" not in st.secrets:
-            st.error("Configuration missing: Please add VERTEX_AI_DEPLOYED_INDEX_ID to your secrets.toml file.")
+            st.error("Configuration missing: Please add VERTEX_AI_DEPLOYED_INDEX_ID.")
             st.stop()
 
         full_index_name = f"projects/{gcp_project_id}/locations/{gcp_region}/indexes/{vertex_ai_index_id}"
         
+        # Initialize without explicit credentials; it will use the environment variable.
         aiplatform.init(project=gcp_project_id, location=gcp_region)
         index_endpoint = aiplatform.MatchingEngineIndexEndpoint(index_endpoint_name=vertex_ai_endpoint_id)
-    except KeyError as e:
-        st.error(f"Configuration missing from secrets.toml for Vertex AI: {e}.")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error initializing Vertex AI Vector Search: {e}")
-        st.stop()
 
-    # --- Gemini API and Embeddings Model Initialization ---
-    try:
+        # --- Gemini API and Embeddings Model Initialization ---
         gemini_api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=gemini_api_key)
-    except KeyError:
-        st.error("GEMINI_API_KEY not found in .streamlit/secrets.toml.")
-        st.stop()
+        
     except Exception as e:
-        st.error(f"Error initializing AI components: {e}")
+        st.error(f"Error during service initialization: {e}")
         st.stop()
         
     return db, index_endpoint, full_index_name
@@ -506,7 +503,7 @@ with st.sidebar:
                 st.info("No documents found.")
 
         if st.button("**Logout**", key="admin_logout_button"):
-            with st.spinner(f"Logging out {st.session_state.email}..."):
+            with st.spinner("Logging out Admin..."):
                 st.session_state.clear()
                 st.rerun()
 
@@ -516,8 +513,12 @@ with st.sidebar:
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
             if st.form_submit_button("Login"):
-                with st.spinner(f"Logging in as {email}..."):
-                    if check_admin(email, password):
+                # BUG FIX: Check for admin credentials to customize the spinner message
+                is_admin_attempt = check_admin(email, password)
+                spinner_message = "Logging in as Admin..." if is_admin_attempt else f"Logging in as {email}..."
+
+                with st.spinner(spinner_message):
+                    if is_admin_attempt:
                         st.session_state.is_admin = True
                         st.session_state.user_id = "admin"
                         st.session_state.email = email
