@@ -9,3 +9,4 @@ sentence-transformers
 torch
 google-generativeai
 openpyxl
+python-docx
