@@ -11,3 +11,4 @@ google-generativeai
 openpyxl
 python-docx
 bcrypt
+google-cloud-aiplatform
