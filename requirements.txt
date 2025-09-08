@@ -10,3 +10,4 @@ torch
 google-generativeai
 openpyxl
 python-docx
+bcrypt
