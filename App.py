@@ -20,6 +20,8 @@ import mimetypes
 from google.cloud import aiplatform
 # BUG FIX: Use the direct, versioned import for IndexDatapoint
 from google.cloud.aiplatform_v1.types import IndexDatapoint
+# BUG FIX: Import the service_account module to handle credentials explicitly
+from google.oauth2 import service_account
 import ast # Safely parse string representations of Python literals
 import time # Import the time module for the sequential display effect
 
@@ -46,31 +48,25 @@ def init_services():
     Initializes and caches connections to all backend services. This function uses a robust
     authentication method that works for both local development and Streamlit Cloud deployment.
     """
+    creds_dict = None
+    # --- Unified Credential Handling ---
     try:
-        # --- Unified Credential Handling for Deployment ---
-        cred_path = "gcp_creds.json"
         if os.path.exists("serviceAccountKey.json"):
-            # Use local key file if it exists
-            cred_path = "serviceAccountKey.json"
+            with open("serviceAccountKey.json") as f:
+                creds_dict = json.load(f)
         elif "firebase" in st.secrets:
-            # Otherwise, use secrets and write to a temporary file for cloud deployment
             firebase_creds = st.secrets["firebase"]
             if isinstance(firebase_creds, str):
                 creds_dict = ast.literal_eval(firebase_creds)
             else:
                 creds_dict = dict(firebase_creds)
-            with open(cred_path, "w") as f:
-                json.dump(creds_dict, f)
         else:
-            st.error("Error: No Google Cloud credentials found.")
+            st.error("Error: No Google Cloud credentials found in local file or secrets.")
             st.stop()
-        
-        # Set the environment variable for Google Cloud libraries
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
         # --- Firestore Initialization ---
         if not firebase_admin._apps:
-            cred_obj_for_firebase = credentials.Certificate(cred_path)
+            cred_obj_for_firebase = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred_obj_for_firebase)
         db = fa_firestore.client()
 
@@ -85,8 +81,9 @@ def init_services():
 
         full_index_name = f"projects/{gcp_project_id}/locations/{gcp_region}/indexes/{vertex_ai_index_id}"
         
-        # Initialize without explicit credentials; it will use the environment variable.
-        aiplatform.init(project=gcp_project_id, location=gcp_region)
+        # Explicitly create and pass credentials to the AI Platform client.
+        gcp_credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        aiplatform.init(project=gcp_project_id, location=gcp_region, credentials=gcp_credentials)
         index_endpoint = aiplatform.MatchingEngineIndexEndpoint(index_endpoint_name=vertex_ai_endpoint_id)
 
         # --- Gemini API and Embeddings Model Initialization ---
