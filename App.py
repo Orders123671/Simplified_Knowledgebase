@@ -17,7 +17,7 @@ import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
 import bcrypt
 import mimetypes
-from google.cloud import aiplatform
+from google.cloud import aiplatform, storage
 # BUG FIX: Use the direct, versioned import for IndexDatapoint
 from google.cloud.aiplatform_v1.types import IndexDatapoint
 # BUG FIX: Import the service_account module to handle credentials explicitly
@@ -30,14 +30,31 @@ LOGO_PATH = "Katrina_logo.png"
 page_icon = LOGO_PATH if os.path.exists(LOGO_PATH) else "🎂"
 st.set_page_config(page_title="Katrina Knowledgebase", page_icon=page_icon, layout="wide")
 
-# Add custom CSS to style buttons
+# Add custom CSS to style buttons and chat container
 st.markdown("""
 <style>
-.stButton>button, .stFormSubmitButton>button {
-    background-color: #ff1493;
-    color: white;
-    font-weight: bold;
-}
+    .stButton>button, .stFormSubmitButton>button {
+        background-color: #ff1493;
+        color: white;
+        font-weight: bold;
+    }
+    .chat-container {
+        border: 2px solid #F0F2F6;
+        border-radius: 10px;
+        padding: 20px;
+        margin-top: 20px;
+    }
+    .footer {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        background-color: #F0F2F6;
+        color: #31333F;
+        text-align: center;
+        padding: 10px;
+        font-size: 14px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -64,11 +81,18 @@ def init_services():
             st.error("Error: No Google Cloud credentials found in local file or secrets.")
             st.stop()
 
+        gcp_credentials = service_account.Credentials.from_service_account_info(creds_dict)
+
         # --- Firestore Initialization ---
         if not firebase_admin._apps:
             cred_obj_for_firebase = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred_obj_for_firebase)
         db = fa_firestore.client()
+
+        # --- Google Cloud Storage Initialization ---
+        storage_client = storage.Client(credentials=gcp_credentials)
+        gcs_bucket_name = st.secrets["GCP_STORAGE_BUCKET"]
+        bucket = storage_client.bucket(gcs_bucket_name)
 
         # --- Vertex AI Vector Search Initialization ---
         gcp_project_id = st.secrets["GCP_PROJECT_ID"]
@@ -81,8 +105,6 @@ def init_services():
 
         full_index_name = f"projects/{gcp_project_id}/locations/{gcp_region}/indexes/{vertex_ai_index_id}"
         
-        # Explicitly create and pass credentials to the AI Platform client.
-        gcp_credentials = service_account.Credentials.from_service_account_info(creds_dict)
         aiplatform.init(project=gcp_project_id, location=gcp_region, credentials=gcp_credentials)
         index_endpoint = aiplatform.MatchingEngineIndexEndpoint(index_endpoint_name=vertex_ai_endpoint_id)
 
@@ -94,10 +116,10 @@ def init_services():
         st.error(f"Error during service initialization: {e}")
         st.stop()
         
-    return db, index_endpoint, full_index_name
+    return db, index_endpoint, full_index_name, bucket
 
 # Initialize all services at once and cache the result
-db, index_endpoint, full_index_name = init_services()
+db, index_endpoint, full_index_name, gcs_bucket = init_services()
 
 
 # --- Gemini API and Embeddings Model Initialization ---
@@ -175,6 +197,18 @@ def check_admin(email, password):
 def get_mime_type(filename):
     return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
+def text_chunker(text, chunk_size=1000, chunk_overlap=200):
+    """Splits a long text into smaller chunks."""
+    if text is None or not text.strip():
+        return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+    return chunks
+
 def extract_text_from_pdf(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     text = ""
@@ -194,21 +228,27 @@ def extract_text_from_image(image_file):
         st.error(f"Error performing OCR: {e}. Please ensure Tesseract is installed and in your system's PATH.")
         return None
 
-def extract_text_from_xlsx(xlsx_file):
+def get_structured_chunks_from_xlsx(xlsx_file):
+    """
+    Extracts data from an Excel file and treats each row as a distinct chunk.
+    """
     try:
         import openpyxl
         xls = pd.ExcelFile(xlsx_file)
-        text = ""
+        chunks = []
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            text += df.to_string() + "\n\n"
-        return text
+            for index, row in df.iterrows():
+                row_sentence = ", ".join([f"{col} is {val}" for col, val in row.items() if pd.notna(val)])
+                if row_sentence:
+                    chunks.append(f"In sheet '{sheet_name}', record {index+1}: {row_sentence}.")
+        return chunks
     except ImportError:
         st.error("Error processing XLSX file: Missing optional dependency 'openpyxl'.")
-        return None
+        return []
     except Exception as e:
         st.error(f"Error processing XLSX file: {e}")
-        return None
+        return []
 
 def extract_text_from_docx(docx_file):
     try:
@@ -221,16 +261,23 @@ def extract_text_from_docx(docx_file):
         st.error(f"Error processing DOCX file: {e}")
         return None
 
-def create_document_with_embedding(title, filename, content, content_type, image_data=None, original_file_bytes=None):
+def create_document_with_embedding(title, filename, chunks, content_type, image_data=None, original_file_bytes=None):
     doc_id = str(uuid.uuid4())
-    doc_ref = db.collection("knowledge_base").document(doc_id)
+    main_doc_ref = db.collection("knowledge_base").document(doc_id)
     
-    embedding = get_embedding(content)
-    
+    download_url = None
+    if original_file_bytes:
+        try:
+            blob = gcs_bucket.blob(f"{doc_id}_{filename}")
+            blob.upload_from_string(original_file_bytes, content_type=get_mime_type(filename))
+            download_url = blob.public_url
+        except Exception as e:
+            st.error(f"Failed to upload file to Google Cloud Storage: {e}")
+            return
+
     data_to_store = {
-        "title": title, "filename": filename, "content": content,
-        "content_type": content_type, "timestamp": fa_firestore.SERVER_TIMESTAMP,
-        "uuid": doc_id
+        "title": title, "filename": filename, "content_type": content_type,
+        "timestamp": fa_firestore.SERVER_TIMESTAMP, "uuid": doc_id, "download_url": download_url
     }
 
     if image_data:
@@ -241,31 +288,40 @@ def create_document_with_embedding(title, filename, content, content_type, image
         img.save(buffered, format="PNG")
         data_to_store["image_data"] = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    if original_file_bytes:
-        data_to_store["original_file"] = base64.b64encode(original_file_bytes).decode('utf-8')
-    
-    doc_ref.set(data_to_store)
+    main_doc_ref.set(data_to_store)
 
-    try:
-        index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
+    if not chunks:
+        st.warning("Could not extract any text to index from the document.")
+        return
+
+    batch = db.batch()
+    datapoints_for_vertex = []
+    chunks_collection_ref = main_doc_ref.collection("chunks")
+
+    for i, chunk_text in enumerate(chunks):
+        chunk_doc_id = f"{doc_id}::{i}"
+        embedding = get_embedding(chunk_text)
         
-        datapoint = IndexDatapoint(
-            datapoint_id=doc_id,
+        chunk_doc_ref = chunks_collection_ref.document(str(i))
+        batch.set(chunk_doc_ref, {"text": chunk_text})
+
+        datapoints_for_vertex.append(IndexDatapoint(
+            datapoint_id=chunk_doc_id,
             feature_vector=embedding
-        )
-        
-        index.upsert_datapoints(datapoints=[datapoint])
-        st.success(f"Successfully added '{title}' to the knowledge base and Vector Search index!")
+        ))
+    
+    try:
+        batch.commit()
+        index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
+        index.upsert_datapoints(datapoints=datapoints_for_vertex)
+        st.success(f"Successfully chunked, indexed, and added '{title}' to the knowledge base!")
         get_all_documents.clear()
     except Exception as e:
-        st.error(f"Failed to add embedding to Vertex AI Vector Search: {e}")
-        doc_ref.delete()
+        st.error(f"Failed during batch processing: {e}")
+        main_doc_ref.delete()
         st.warning(f"Removed '{title}' from Firestore due to indexing failure.")
 
 def get_conversational_response_stream(user_query, retrieved_docs, external_info=None):
-    """
-    Generates a conversational response from the AI model as a stream.
-    """
     if not retrieved_docs and not external_info:
         yield "I am sorry, but I cannot find any relevant information."
         return
@@ -275,8 +331,8 @@ def get_conversational_response_stream(user_query, retrieved_docs, external_info
     context_list = []
     for doc in retrieved_docs:
         title = doc.get('title', 'Untitled Document')
-        content = doc.get('content', '')
-        prefix = f"The following is from the spreadsheet titled '{title}':\n" if doc.get('content_type') == 'xlsx' else f"The following is from the document titled '{title}':\n"
+        content = doc.get('chunk_text', '')
+        prefix = f"From the document titled '{title}':\n"
         context_list.append(f"{prefix}{content}")
 
     full_context = "\n\n".join(context_list)
@@ -290,7 +346,6 @@ def get_conversational_response_stream(user_query, retrieved_docs, external_info
     
     try:
         model = genai.GenerativeModel('gemini-1.5-pro')
-        # Use stream=True to get a generator object
         response_stream = model.generate_content(prompt, stream=True)
         for chunk in response_stream:
             yield chunk.text
@@ -302,33 +357,39 @@ def get_conversational_response_stream(user_query, retrieved_docs, external_info
 def get_similar_documents(query_embedding):
     try:
         deployed_index_id = st.secrets["VERTEX_AI_DEPLOYED_INDEX_ID"]
-
         response = index_endpoint.find_neighbors(
             queries=[query_embedding],
             deployed_index_id=deployed_index_id,
             num_neighbors=3
         )
-
         if not response or not response[0]:
             return []
 
-        neighbor_ids = [neighbor.id for neighbor in response[0]]
-        if not neighbor_ids:
-            return []
+        final_docs = []
+        for neighbor in response[0]:
+            try:
+                doc_id, chunk_index = neighbor.id.split("::")
+                main_doc_ref = db.collection("knowledge_base").document(doc_id)
+                chunk_doc_ref = main_doc_ref.collection("chunks").document(chunk_index)
+                
+                main_doc = main_doc_ref.get()
+                chunk_doc = chunk_doc_ref.get()
 
-        docs_ref = db.collection("knowledge_base")
-        firestore_query = docs_ref.where("uuid", "in", neighbor_ids)
-        return [doc.to_dict() for doc in firestore_query.stream()]
+                if main_doc.exists and chunk_doc.exists:
+                    doc_data = main_doc.to_dict()
+                    doc_data['chunk_text'] = chunk_doc.to_dict().get('text', '')
+                    final_docs.append(doc_data)
+            except (ValueError, IndexError):
+                print(f"Could not parse neighbor ID: {neighbor.id}")
+                continue
         
+        return final_docs
     except Exception as e:
         st.error(f"Error querying Vertex AI Vector Search: {e}")
         return []
 
 def fallback_keyword_search(user_query):
-    docs = db.collection("knowledge_base").stream()
-    keywords = user_query.lower().split()
-    results = [doc.to_dict() for doc in docs if any(keyword in doc.to_dict().get('content', '').lower() for keyword in keywords)]
-    return results[:10]
+    return []
 
 @st.cache_data(ttl=600)
 def get_external_information(user_query):
@@ -352,26 +413,60 @@ def get_intelligent_search_query(user_query):
         print(f"Error in get_intelligent_search_query: {e}")
         return user_query
 
-def clear_chat_history():
-    st.session_state.messages = []
-    get_external_information.clear()
-    get_intelligent_search_query.clear()
+@st.cache_data(ttl=600)
+def get_spelling_suggestion(user_query):
+    """
+    Uses a generative model to correct spelling and suggest a clearer query.
+    """
+    if not user_query or len(user_query.split()) < 2:
+        return user_query
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = (
+            "You are a helpful spelling and grammar assistant. Correct any spelling mistakes in the following user query "
+            "and return only the corrected phrase without any preamble. If the query is already correct, return it unchanged. "
+            f"Original query: '{user_query}'\nCorrected query:"
+        )
+        response = model.generate_content(prompt)
+        corrected_query = response.text.strip().strip('"')
+        if len(corrected_query.split()) > len(user_query.split()) * 1.5:
+             return user_query
+        return corrected_query
+    except Exception as e:
+        print(f"Error in get_spelling_suggestion: {e}")
+        return user_query
 
-# UX IMPROVEMENT: Add a spinner to the document list refresh
+def clear_search():
+    st.session_state.search_query = None
+    if 'search_image' in st.session_state:
+        del st.session_state.search_image
+
 @st.cache_data(show_spinner="Refreshing document list...")
 def get_all_documents():
     docs = db.collection("knowledge_base").stream()
-    return [{"id": doc.id, "title": doc.to_dict().get("title", "Untitled")} for doc in docs]
+    return [{"id": doc.id, "title": doc.to_dict().get("title", "Untitled"), "filename": doc.to_dict().get("filename", "Unknown")} for doc in docs]
 
-def delete_multiple_documents(doc_ids):
+def delete_multiple_documents(doc_ids_and_filenames):
     try:
-        for doc_id in doc_ids:
-            db.collection("knowledge_base").document(doc_id).delete()
-        
         index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
-        index.remove_datapoints(datapoint_ids=doc_ids)
+        datapoint_ids_to_delete = []
 
-        st.success(f"Successfully deleted {len(doc_ids)} documents.")
+        for doc_id, filename in doc_ids_and_filenames:
+            blob = gcs_bucket.blob(f"{doc_id}_{filename}")
+            if blob.exists():
+                blob.delete()
+
+            chunks_ref = db.collection("knowledge_base").document(doc_id).collection("chunks")
+            for chunk_doc in chunks_ref.stream():
+                datapoint_ids_to_delete.append(f"{doc_id}::{chunk_doc.id}")
+                chunk_doc.reference.delete()
+
+            db.collection("knowledge_base").document(doc_id).delete()
+
+        if datapoint_ids_to_delete:
+            index.remove_datapoints(datapoint_ids=datapoint_ids_to_delete)
+
+        st.success(f"Successfully deleted {len(doc_ids_and_filenames)} document(s) and all associated data.")
         get_all_documents.clear()
         st.rerun()
     except Exception as e:
@@ -411,11 +506,12 @@ with st.sidebar:
     if st.session_state.user_id and not st.session_state.is_admin:
         st.markdown("<h2 style='text-align: center;'>User Portal</h2>", unsafe_allow_html=True)
         st.success(f"Logged in as {st.session_state.email}")
-        st.info("You can now use the chat assistant.")
+        st.info("You can now use the search assistant.")
         if st.button("**Logout**", key="user_logout_button"):
-            with st.spinner(f"Logging out {st.session_state.email}..."):
+            logout_message = f"Logging out {st.session_state.email}..."
+            with st.spinner(logout_message):
                 st.session_state.clear()
-                st.rerun()
+            st.rerun()
 
     elif st.session_state.is_admin:
         st.markdown("<h2 style='text-align: center;'>Admin Portal</h2>", unsafe_allow_html=True)
@@ -452,57 +548,73 @@ with st.sidebar:
             st.markdown("### Architecture Status")
             st.success("Powered by Google Cloud Vertex AI Vector Search.")
             st.markdown("---")
-            st.markdown("<h4 style='text-align: center;'>Upload Files</h4>", unsafe_allow_html=True)
-            uploaded_file = st.file_uploader("Choose a file", type=["pdf", "jpeg", "jpg", "png", "txt", "csv", "xlsx", "docx"], key="admin_uploader")
-            if uploaded_file:
-                original_bytes = uploaded_file.getvalue()
-                title = uploaded_file.name
-                ext = title.split('.')[-1].lower()
-                content, image_data = None, None
-                
-                if ext == "pdf": content = extract_text_from_pdf(io.BytesIO(original_bytes))
-                elif ext in ["jpeg", "jpg", "png"]:
-                    content = extract_text_from_image(io.BytesIO(original_bytes))
-                    if content: image_data = base64.b64encode(original_bytes).decode('utf-8')
-                elif ext in ["txt", "csv"]: content = original_bytes.decode("utf-8")
-                elif ext == "xlsx": content = extract_text_from_xlsx(io.BytesIO(original_bytes))
-                elif ext == "docx": content = extract_text_from_docx(io.BytesIO(original_bytes))
-                
-                if content:
-                    with st.expander("Show Extracted Content"):
-                        st.text_area("Content:", value=content, height=300)
-                    with st.spinner("Adding document to knowledge base..."):
-                        create_document_with_embedding(title, title, content, ext, image_data, original_file_bytes=original_bytes)
+            
+            upload_option = st.radio(
+                "Choose an upload method:",
+                ("Upload a File", "Add Text Content"),
+                horizontal=True, key="upload_type"
+            )
 
-            st.markdown("<h4 style='text-align: center;'>Add Text</h4>", unsafe_allow_html=True)
-            with st.form("text_form", clear_on_submit=True):
-                text_title = st.text_input("Title:")
-                text_content = st.text_area("Content:")
-                if st.form_submit_button("**Save Text**"):
-                    if text_title and text_content:
-                        filename = f"{text_title}.txt" if not text_title.lower().endswith('.txt') else text_title
-                        with st.spinner("Adding text to knowledge base..."):
-                            create_document_with_embedding(text_title, filename, text_content, "string", original_file_bytes=text_content.encode('utf-8'))
-                    else: st.warning("Please provide both a title and content.")
+            if upload_option == "Upload a File":
+                with st.form("file_upload_form", clear_on_submit=True):
+                    uploaded_file = st.file_uploader("Choose a file", type=["pdf", "jpeg", "jpg", "png", "txt", "csv", "xlsx", "docx"])
+                    if st.form_submit_button("Upload and Index File"):
+                        if uploaded_file:
+                            original_bytes = uploaded_file.getvalue()
+                            title = uploaded_file.name
+                            ext = title.split('.')[-1].lower()
+                            chunks, image_data = [], None
+
+                            if ext in ["jpeg", "jpg", "png"]:
+                                ocr_text = extract_text_from_image(io.BytesIO(original_bytes))
+                                image_description = get_image_description(Image.open(io.BytesIO(original_bytes)))
+                                combined_text = f"Image Description: {image_description}\n\nText found in image: {ocr_text}"
+                                chunks = text_chunker(combined_text)
+                                if combined_text.strip(): image_data = base64.b64encode(original_bytes).decode('utf-8')
+                            elif ext == "pdf": chunks = text_chunker(extract_text_from_pdf(io.BytesIO(original_bytes)))
+                            elif ext in ["txt", "csv"]: chunks = text_chunker(original_bytes.decode("utf-8"))
+                            elif ext == "xlsx": chunks = get_structured_chunks_from_xlsx(io.BytesIO(original_bytes))
+                            elif ext == "docx": chunks = text_chunker(extract_text_from_docx(io.BytesIO(original_bytes)))
+                            
+                            if chunks:
+                                with st.spinner("Adding document to knowledge base..."):
+                                    create_document_with_embedding(title, title, chunks, ext, image_data, original_file_bytes=original_bytes)
+                        else:
+                            st.warning("Please choose a file to upload.")
+
+            elif upload_option == "Add Text Content":
+                with st.form("text_form", clear_on_submit=True):
+                    text_title = st.text_input("Title:")
+                    text_content = st.text_area("Content:")
+                    if st.form_submit_button("**Save Text**"):
+                        if text_title and text_content:
+                            filename = f"{text_title}.txt" if not text_title.lower().endswith('.txt') else text_title
+                            chunks = text_chunker(text_content)
+                            with st.spinner("Adding text to knowledge base..."):
+                                create_document_with_embedding(text_title, filename, chunks, "string", original_file_bytes=text_content.encode('utf-8'))
+                        else:
+                            st.warning("Please provide both a title and content.")
 
             st.markdown("---")
             st.markdown("<h4 style='text-align: center;'>Delete Data</h4>", unsafe_allow_html=True)
             all_docs = get_all_documents()
             if all_docs:
-                doc_options = {f"{doc['title']} (ID: {doc['id']})": doc['id'] for doc in all_docs}
-                selected_doc_ids = [doc_options[option] for option in st.multiselect("Select documents to delete:", list(doc_options.keys()))]
+                doc_options = {f"{doc['title']} (ID: {doc['id']})": (doc['id'], doc['filename']) for doc in all_docs}
+                selected_options = st.multiselect("Select documents to delete:", list(doc_options.keys()))
+                selected_docs_info = [doc_options[option] for option in selected_options]
                 if st.button("**Delete Selected**", key="delete_docs_button"):
-                    if selected_doc_ids:
+                    if selected_docs_info:
                         with st.spinner("Deleting selected documents..."):
-                            delete_multiple_documents(selected_doc_ids)
-                    else: st.warning("Please select at least one document.")
+                            delete_multiple_documents(selected_docs_info)
+                    else:
+                        st.warning("Please select at least one document.")
             else:
                 st.info("No documents found.")
 
         if st.button("**Logout**", key="admin_logout_button"):
             with st.spinner("Logging out Admin..."):
                 st.session_state.clear()
-                st.rerun()
+            st.rerun()
 
     else:
         st.markdown("<h2 style='text-align: center;'>Login</h2>", unsafe_allow_html=True)
@@ -510,7 +622,7 @@ with st.sidebar:
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
             if st.form_submit_button("Login"):
-                # BUG FIX: Check for admin credentials to customize the spinner message
+                login_successful = False
                 is_admin_attempt = check_admin(email, password)
                 spinner_message = "Logging in as Admin..." if is_admin_attempt else f"Logging in as {email}..."
 
@@ -519,16 +631,19 @@ with st.sidebar:
                         st.session_state.is_admin = True
                         st.session_state.user_id = "admin"
                         st.session_state.email = email
+                        login_successful = True
                     else:
                         user_id, is_admin_user = check_user(email, password)
                         if user_id:
                             st.session_state.user_id = user_id
                             st.session_state.is_admin = is_admin_user
                             st.session_state.email = email
+                            login_successful = True
                         else:
                             st.error("Invalid email or password.")
-                    if "user_id" in st.session_state and st.session_state.user_id:
-                        st.rerun()
+                
+                if login_successful:
+                    st.rerun()
 
 # --- Main App Logic ---
 logo_base_64 = get_image_as_base64(LOGO_PATH)
@@ -542,51 +657,47 @@ if st.session_state.user_id:
     if st.session_state.is_admin:
         st.info("Welcome, Admin. Please use the sidebar to manage users and the knowledge base.")
     else:
-        # UX IMPROVEMENT: Add a welcome message toast for the user's first interaction.
         if 'welcome_message_shown' not in st.session_state:
             st.toast(f"Welcome to the Katrina Knowledgebase, {st.session_state.email}!", icon="🎂")
             st.session_state.welcome_message_shown = True
 
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
+        _, chat_col, _ = st.columns([1, 2, 1])
 
-        # Display chat history
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                # Display retrieved documents if they exist
-                for i, doc in enumerate(message.get("docs", [])):
-                     with st.expander(f"Result: {doc.get('title', 'Untitled')}", expanded=True):
-                        if 'image_data' in doc:
-                            st.image(base64.b64decode(doc['image_data']), width=500)
-                        if 'original_file' in doc and 'filename' in doc:
-                            try:
-                                file_bytes = base64.b64decode(doc['original_file'])
-                                st.download_button(
-                                    label=f"Download '{doc['filename']}'",
-                                    data=file_bytes, file_name=doc['filename'],
-                                    mime=get_mime_type(doc['filename']),
-                                    key=f"dl_{i}_{doc['uuid']}_{message['timestamp']}" # Add timestamp for unique key
-                                )
-                            except Exception as e:
-                                st.error(f"Could not prepare file for download: {e}")
-                
-                if 'image' in message: st.image(message['image'], caption="User Upload")
-
-                # Display the text content of the message
-                # If it was a streaming response, this will show the final, complete text.
-                st.markdown(message["content"])
-
-        # Refactored search logic to handle separate inputs cleanly
-        def process_search(search_query, uploaded_image_obj=None):
-            user_message = {}
-            if uploaded_image_obj:
-                user_message = {"role": "user", "content": f"Searched for image: {search_query}", "image": uploaded_image_obj, "timestamp": pd.Timestamp.now()}
-            else: # Text prompt
-                user_message = {"role": "user", "content": search_query, "timestamp": pd.Timestamp.now()}
-
-            st.session_state.messages.append(user_message)
+        with chat_col:
+            st.markdown('<div class="chat-container">', unsafe_allow_html=True)
             
-            with st.chat_message("assistant"):
+            # --- New, Simplified Workflow ---
+            if 'search_query' not in st.session_state:
+                st.session_state.search_query = None
+            
+            # --- Search Input Handling ---
+            with st.form("image_upload_form", clear_on_submit=True):
+                uploaded_image = st.file_uploader("Search with an image...", type=["jpeg", "jpg", "png"])
+                submitted_image = st.form_submit_button("Search with Image")
+
+            prompt = st.chat_input("Hi, I'm your Katrina Assistant, Ask me")
+
+            if st.button("**New Search**", key="new_chat_main_button"):
+                clear_search()
+                st.rerun()
+            
+            # --- Process input and update state before the rest of the script runs ---
+            if submitted_image and uploaded_image:
+                img = Image.open(uploaded_image)
+                st.session_state.search_query = get_image_description(img)
+                st.session_state.search_image = img
+                st.rerun()
+            
+            elif prompt:
+                st.session_state.search_query = prompt
+                st.session_state.search_image = None
+                st.rerun()
+
+            # --- Display Logic: Only runs if a search has been completed ---
+            if st.session_state.search_query:
+                search_query = st.session_state.search_query
+                uploaded_image_obj = st.session_state.get('search_image')
+
                 with st.spinner("Thinking..."):
                     intelligent_query = get_intelligent_search_query(search_query)
                     query_embedding = get_embedding(intelligent_query)
@@ -594,56 +705,37 @@ if st.session_state.user_id:
                     retrieved_docs = get_similar_documents(query_embedding)
                     if not retrieved_docs:
                         retrieved_docs = fallback_keyword_search(intelligent_query)
+                    
+                    suggestion = get_spelling_suggestion(search_query)
+                    if suggestion.lower() == search_query.lower():
+                        suggestion = None
 
-                # UX IMPROVEMENT: Sequentially display retrieved documents
-                for i, doc in enumerate(retrieved_docs):
-                    with st.expander(f"Result: {doc.get('title', 'Untitled')}", expanded=True):
-                        if 'image_data' in doc:
-                            st.image(base64.b64decode(doc['image_data']), width=500)
-                        if 'original_file' in doc and 'filename' in doc:
-                            try:
-                                file_bytes = base64.b64decode(doc['original_file'])
-                                st.download_button(
-                                    label=f"Download '{doc['filename']}'",
-                                    data=file_bytes, file_name=doc['filename'],
-                                    mime=get_mime_type(doc['filename']),
-                                    key=f"dl_new_{i}_{doc['uuid']}"
-                                )
-                            except Exception as e:
-                                st.error(f"Could not prepare file for download: {e}")
-                    time.sleep(0.5) # Add a delay for the sequential effect
-
-                # Use st.write_stream to render the response as it comes in
-                response_stream = get_conversational_response_stream(search_query, retrieved_docs, external_info)
-                full_response = st.write_stream(response_stream)
-
-            # Append the final, complete message to the session state
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": full_response,
-                "docs": retrieved_docs,
-                "timestamp": pd.Timestamp.now()
-            })
-            st.rerun()
-
-        # --- Search input area ---
-        with st.form("image_upload_form"):
-            uploaded_image = st.file_uploader("Search with an image...", type=["jpeg", "jpg", "png"])
-            submitted = st.form_submit_button("Search with Image")
-            if submitted and uploaded_image:
-                img = Image.open(uploaded_image)
-                search_query = get_image_description(img)
-                process_search(search_query, uploaded_image_obj=img)
-
-        prompt = st.chat_input("Hi, I'm your Katrina Assistant, Ask me")
-        if prompt:
-            process_search(prompt)
-        
-        # Place the "New Chat" button at the bottom of the main chat area
-        if st.button("**New Chat**", key="new_chat_main_button"):
-            clear_chat_history()
-            st.rerun()
-
+                # Display the user's query and the assistant's response
+                with st.chat_message("user"):
+                    if uploaded_image_obj:
+                        st.image(uploaded_image_obj, caption="User Upload")
+                    st.markdown(search_query)
+                
+                with st.chat_message("assistant"):
+                    if suggestion:
+                         if st.button(f"Did you mean: **{suggestion}**?"):
+                            st.session_state.search_query = suggestion
+                            st.session_state.search_image = None
+                            st.rerun()
+                    
+                    for doc in retrieved_docs:
+                        with st.expander(f"Result: {doc.get('title', 'Untitled')}", expanded=True):
+                            if 'image_data' in doc:
+                                st.image(base64.b64decode(doc['image_data']), width=500)
+                            if 'download_url' in doc and doc['download_url']:
+                                st.markdown(f"[{doc['filename']}]({doc['download_url']}) ⬇️")
+                    
+                    response_stream = get_conversational_response_stream(search_query, retrieved_docs, external_info)
+                    st.write_stream(response_stream)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
 else:
     st.info("Please log in using the sidebar to start.")
+
+st.markdown('<div class="footer">Katrina Knowledgebase by Judy Sepe</div>', unsafe_allow_html=True)
 
