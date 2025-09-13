@@ -24,13 +24,15 @@ from google.cloud.aiplatform_v1.types import IndexDatapoint
 from google.oauth2 import service_account
 import ast # Safely parse string representations of Python literals
 import time # Import the time module for the sequential display effect
+import math # Import math for ceiling function in pagination
+import random # Import the random module for the slideshow
 
 # --- UI Layout ---
 LOGO_PATH = "Katrina_logo.png"
 page_icon = LOGO_PATH if os.path.exists(LOGO_PATH) else "🎂"
 st.set_page_config(page_title="Katrina Knowledgebase", page_icon=page_icon, layout="wide")
 
-# Add custom CSS to style buttons and chat container
+# Add custom CSS for a modern design refresh
 st.markdown("""
 <style>
     .stButton>button, .stFormSubmitButton>button {
@@ -44,6 +46,31 @@ st.markdown("""
         padding: 20px;
         margin-top: 20px;
     }
+    
+    /* --- Modern, Interactive Header --- */
+    .custom-header {
+        background: #FFFFFF; /* White Background */
+        padding: 2.5rem; /* Increased padding for more height */
+        border-radius: 15px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+        margin-bottom: 0; /* Removed bottom margin */
+        border-bottom: 1px solid #F0F2F6; /* Subtle border for separation */
+    }
+    
+    .header-content {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 20px;
+    }
+
+    .custom-header h1 {
+        color: #ff1493 !important; /* Darker Pink Font Color for contrast */
+        font-weight: 700;
+        text-shadow: none;
+        margin: 0;
+    }
+
     .footer {
         position: fixed;
         left: 0;
@@ -55,18 +82,32 @@ st.markdown("""
         padding: 10px;
         font-size: 14px;
     }
+
+    /* --- ICON FALLBACK FIX --- */
+    /* FOR SIDEBAR: Forcefully hide the fallback text and replace the icon */
+    [data-testid="baseButton-header"] span {
+        visibility: hidden;
+        position: absolute;
+    }
+    
+    [data-testid="baseButton-header"]::after {
+        content: '«';
+        font-size: 1.5rem;
+        font-weight: bold;
+        color: #ff1493;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
+
 
 # --- Optimized Service Initialization ---
 @st.cache_resource
 def init_services():
-    """
-    Initializes and caches connections to all backend services. This function uses a robust
-    authentication method that works for both local development and Streamlit Cloud deployment.
-    """
     creds_dict = None
-    # --- Unified Credential Handling ---
     try:
         if os.path.exists("serviceAccountKey.json"):
             with open("serviceAccountKey.json") as f:
@@ -83,18 +124,15 @@ def init_services():
 
         gcp_credentials = service_account.Credentials.from_service_account_info(creds_dict)
 
-        # --- Firestore Initialization ---
         if not firebase_admin._apps:
             cred_obj_for_firebase = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred_obj_for_firebase)
         db = fa_firestore.client()
 
-        # --- Google Cloud Storage Initialization ---
         storage_client = storage.Client(credentials=gcp_credentials)
         gcs_bucket_name = st.secrets["GCP_STORAGE_BUCKET"]
         bucket = storage_client.bucket(gcs_bucket_name)
 
-        # --- Vertex AI Vector Search Initialization ---
         gcp_project_id = st.secrets["GCP_PROJECT_ID"]
         gcp_region = st.secrets["GCP_REGION"]
         vertex_ai_index_id = st.secrets["VERTEX_AI_INDEX_ID"]
@@ -102,13 +140,10 @@ def init_services():
         if "VERTEX_AI_DEPLOYED_INDEX_ID" not in st.secrets:
             st.error("Configuration missing: Please add VERTEX_AI_DEPLOYED_INDEX_ID.")
             st.stop()
-
-        full_index_name = f"projects/{gcp_project_id}/locations/{gcp_region}/indexes/{vertex_ai_index_id}"
         
         aiplatform.init(project=gcp_project_id, location=gcp_region, credentials=gcp_credentials)
         index_endpoint = aiplatform.MatchingEngineIndexEndpoint(index_endpoint_name=vertex_ai_endpoint_id)
 
-        # --- Gemini API and Embeddings Model Initialization ---
         gemini_api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=gemini_api_key)
         
@@ -116,20 +151,24 @@ def init_services():
         st.error(f"Error during service initialization: {e}")
         st.stop()
         
-    return db, index_endpoint, full_index_name, bucket
+    return db, index_endpoint, bucket
 
-# Initialize all services at once and cache the result
-db, index_endpoint, full_index_name, gcs_bucket = init_services()
-
+# Initialize services
+db, index_endpoint, gcs_bucket = init_services()
 
 # --- Gemini API and Embeddings Model Initialization ---
 @st.cache_resource
 def get_embedding(content):
-    return genai.embed_content(model="models/embedding-001",
-                                 content=content,
-                                 task_type="retrieval_query")["embedding"]
+    return genai.embed_content(model="models/text-embedding-004",
+                                       content=content,
+                                       task_type="retrieval_document")["embedding"]
 
-# --- User Authentication Functions ---
+def get_query_embedding(content):
+    return genai.embed_content(model="models/text-embedding-004",
+                                       content=content,
+                                       task_type="retrieval_query")["embedding"]
+
+# --- User Authentication and Helper Functions ---
 @st.cache_data(ttl=300)
 def get_user_count():
     users_ref = db.collection("users")
@@ -193,12 +232,10 @@ def check_admin(email, password):
         return False
     return False
 
-# --- Helper Functions for File Processing and Embedding ---
 def get_mime_type(filename):
     return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-def text_chunker(text, chunk_size=1000, chunk_overlap=200):
-    """Splits a long text into smaller chunks."""
+def text_chunker(text, chunk_size=500, chunk_overlap=100):
     if text is None or not text.strip():
         return []
     chunks = []
@@ -219,7 +256,6 @@ def extract_text_from_pdf(pdf_file):
 def extract_text_from_image(image_file):
     if 'TESSERACT_CMD' in os.environ:
         pytesseract.pytesseract.tesseract_cmd = os.environ['TESSERACT_CMD']
-    
     try:
         image = Image.open(image_file)
         text = pytesseract.image_to_string(image)
@@ -229,20 +265,18 @@ def extract_text_from_image(image_file):
         return None
 
 def get_structured_chunks_from_xlsx(xlsx_file):
-    """
-    Extracts data from an Excel file and treats each row as a distinct chunk.
-    """
     try:
         import openpyxl
         xls = pd.ExcelFile(xlsx_file)
-        chunks = []
+        all_text = []
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
             for index, row in df.iterrows():
                 row_sentence = ", ".join([f"{col} is {val}" for col, val in row.items() if pd.notna(val)])
                 if row_sentence:
-                    chunks.append(f"In sheet '{sheet_name}', record {index+1}: {row_sentence}.")
-        return chunks
+                    all_text.append(f"In sheet '{sheet_name}', record {index+1}: {row_sentence}.")
+        
+        return text_chunker(" ".join(all_text))
     except ImportError:
         st.error("Error processing XLSX file: Missing optional dependency 'openpyxl'.")
         return []
@@ -270,56 +304,82 @@ def create_document_with_embedding(title, filename, chunks, content_type, image_
         try:
             blob = gcs_bucket.blob(f"{doc_id}_{filename}")
             blob.upload_from_string(original_file_bytes, content_type=get_mime_type(filename))
+            blob.make_public()
             download_url = blob.public_url
         except Exception as e:
             st.error(f"Failed to upload file to Google Cloud Storage: {e}")
             return
 
-    data_to_store = {
-        "title": title, "filename": filename, "content_type": content_type,
-        "timestamp": fa_firestore.SERVER_TIMESTAMP, "uuid": doc_id, "download_url": download_url
-    }
-
+    thumbnail_data = None
     if image_data:
         image_bytes_decoded = base64.b64decode(image_data)
         img = Image.open(io.BytesIO(image_bytes_decoded))
         img.thumbnail((500, 500), Image.Resampling.LANCZOS)
         buffered = io.BytesIO()
         img.save(buffered, format="PNG")
-        data_to_store["image_data"] = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        thumbnail_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    main_doc_ref.set(data_to_store)
+    main_doc_ref.set({
+        "title": title, "filename": filename, "content_type": content_type,
+        "timestamp": fa_firestore.SERVER_TIMESTAMP, "uuid": doc_id, "download_url": download_url,
+        "image_data": thumbnail_data
+    })
 
     if not chunks:
         st.warning("Could not extract any text to index from the document.")
         return
 
+    chunks_collection_ref = main_doc_ref.collection("chunks")
+    full_index_name = f"projects/{st.secrets['GCP_PROJECT_ID']}/locations/{st.secrets['GCP_REGION']}/indexes/{st.secrets['VERTEX_AI_INDEX_ID']}"
+    index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
+    
     batch = db.batch()
     datapoints_for_vertex = []
-    chunks_collection_ref = main_doc_ref.collection("chunks")
-
-    for i, chunk_text in enumerate(chunks):
-        chunk_doc_id = f"{doc_id}::{i}"
-        embedding = get_embedding(chunk_text)
-        
-        chunk_doc_ref = chunks_collection_ref.document(str(i))
-        batch.set(chunk_doc_ref, {"text": chunk_text})
-
-        datapoints_for_vertex.append(IndexDatapoint(
-            datapoint_id=chunk_doc_id,
-            feature_vector=embedding
-        ))
+    commit_counter = 0
+    batch_limit = 400
     
     try:
-        batch.commit()
-        index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
-        index.upsert_datapoints(datapoints=datapoints_for_vertex)
+        for i, chunk_text in enumerate(chunks):
+            embedding = get_embedding(chunk_text)
+            chunk_doc_id = f"{doc_id}::{i}"
+            chunk_doc_ref = chunks_collection_ref.document(str(i))
+            
+            batch.set(chunk_doc_ref, {
+                "text": chunk_text,
+                "embedding": embedding,
+                "parent_title": title,
+                "parent_download_url": download_url,
+                "parent_filename": filename,
+                "parent_image_data": thumbnail_data
+            })
+            
+            datapoints_for_vertex.append(IndexDatapoint(
+                datapoint_id=chunk_doc_id,
+                feature_vector=embedding
+            ))
+            
+            commit_counter += 1
+
+            if commit_counter >= batch_limit:
+                batch.commit()
+                index.upsert_datapoints(datapoints=datapoints_for_vertex)
+                batch = db.batch()
+                datapoints_for_vertex = []
+                commit_counter = 0
+
+        if commit_counter > 0:
+            batch.commit()
+        if datapoints_for_vertex:
+            index.upsert_datapoints(datapoints=datapoints_for_vertex)
+        
         st.success(f"Successfully chunked, indexed, and added '{title}' to the knowledge base!")
         get_all_documents.clear()
+
     except Exception as e:
         st.error(f"Failed during batch processing: {e}")
         main_doc_ref.delete()
-        st.warning(f"Removed '{title}' from Firestore due to indexing failure.")
+        st.warning(f"Removed '{title}' from Firestore due to processing failure.")
+
 
 def get_conversational_response_stream(user_query, retrieved_docs, external_info=None):
     if not retrieved_docs and not external_info:
@@ -353,39 +413,44 @@ def get_conversational_response_stream(user_query, retrieved_docs, external_info
         st.error(f"Error generating response from Gemini: {e}")
         yield "Sorry, I am unable to generate a response at this time."
 
-
 def get_similar_documents(query_embedding):
     try:
         deployed_index_id = st.secrets["VERTEX_AI_DEPLOYED_INDEX_ID"]
         response = index_endpoint.find_neighbors(
             queries=[query_embedding],
             deployed_index_id=deployed_index_id,
-            num_neighbors=3
+            num_neighbors=50
         )
         if not response or not response[0]:
             return []
 
         final_docs = []
+        chunk_refs = []
         for neighbor in response[0]:
             try:
                 doc_id, chunk_index = neighbor.id.split("::")
-                main_doc_ref = db.collection("knowledge_base").document(doc_id)
-                chunk_doc_ref = main_doc_ref.collection("chunks").document(chunk_index)
-                
-                main_doc = main_doc_ref.get()
-                chunk_doc = chunk_doc_ref.get()
-
-                if main_doc.exists and chunk_doc.exists:
-                    doc_data = main_doc.to_dict()
-                    doc_data['chunk_text'] = chunk_doc.to_dict().get('text', '')
-                    final_docs.append(doc_data)
+                chunk_refs.append(db.collection("knowledge_base").document(doc_id).collection("chunks").document(chunk_index))
             except (ValueError, IndexError):
                 print(f"Could not parse neighbor ID: {neighbor.id}")
                 continue
         
+        chunk_docs = db.get_all(chunk_refs)
+
+        for chunk_doc in chunk_docs:
+            if chunk_doc.exists:
+                chunk_data = chunk_doc.to_dict()
+                final_docs.append({
+                    'title': chunk_data.get('parent_title'),
+                    'filename': chunk_data.get('parent_filename'),
+                    'download_url': chunk_data.get('parent_download_url'),
+                    'chunk_text': chunk_data.get('text'),
+                    'image_data': chunk_data.get('parent_image_data'),
+                    'uuid': chunk_doc.reference.parent.parent.id
+                })
+        
         return final_docs
     except Exception as e:
-        st.error(f"Error querying Vertex AI Vector Search: {e}")
+        st.error(f"Error querying services: {e}")
         return []
 
 def fallback_keyword_search(user_query):
@@ -415,9 +480,6 @@ def get_intelligent_search_query(user_query):
 
 @st.cache_data(ttl=600)
 def get_spelling_suggestion(user_query):
-    """
-    Uses a generative model to correct spelling and suggest a clearer query.
-    """
     if not user_query or len(user_query.split()) < 2:
         return user_query
     try:
@@ -438,8 +500,11 @@ def get_spelling_suggestion(user_query):
 
 def clear_search():
     st.session_state.search_query = None
-    if 'search_image' in st.session_state:
-        del st.session_state.search_image
+    keys_to_delete = ['search_image', 'page_number', 'search_results', 'external_info']
+    for key in keys_to_delete:
+        if key in st.session_state:
+            del st.session_state[key]
+
 
 @st.cache_data(show_spinner="Refreshing document list...")
 def get_all_documents():
@@ -448,6 +513,7 @@ def get_all_documents():
 
 def delete_multiple_documents(doc_ids_and_filenames):
     try:
+        full_index_name = f"projects/{st.secrets['GCP_PROJECT_ID']}/locations/{st.secrets['GCP_REGION']}/indexes/{st.secrets['VERTEX_AI_INDEX_ID']}"
         index = aiplatform.MatchingEngineIndex(index_name=full_index_name)
         datapoint_ids_to_delete = []
 
@@ -487,7 +553,123 @@ def get_image_as_base64(path):
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode()
 
-# --- Initialize session state ---
+# A curated list of reliable, direct-linked cake images from Pexels
+CAKE_IMAGE_URLS = [
+    "https://images.pexels.com/photos/1055272/pexels-photo-1055272.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/291528/pexels-photo-291528.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/140831/pexels-photo-140831.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/2067405/pexels-photo-2067405.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/132694/pexels-photo-132694.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/264771/pexels-photo-264771.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1721934/pexels-photo-1721934.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/827516/pexels-photo-827516.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/461431/pexels-photo-461431.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/210537/pexels-photo-210537.jpeg?auto=compress&cs=tinysrgb&w=600"
+]
+
+def add_login_page_cake_slideshow():
+    """Injects HTML and CSS for a dynamic cake image slideshow on the login page."""
+    image_urls = random.sample(CAKE_IMAGE_URLS, 5)
+    slideshow_html = f"""
+    <style>
+        .login-slideshow-container {{
+            max-width: 800px;
+            position: relative;
+            margin: 25px auto;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 8px 16px 0 rgba(0,0,0,0.2);
+            height: 400px;
+        }}
+        .login-slideshow-container .slide-image {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 0;
+            animation: fadeEffectLogin 20s infinite;
+        }}
+        .login-slideshow-container .slide-image:nth-child(1) {{ animation-delay: 0s; }}
+        .login-slideshow-container .slide-image:nth-child(2) {{ animation-delay: 4s; }}
+        .login-slideshow-container .slide-image:nth-child(3) {{ animation-delay: 8s; }}
+        .login-slideshow-container .slide-image:nth-child(4) {{ animation-delay: 12s; }}
+        .login-slideshow-container .slide-image:nth-child(5) {{ animation-delay: 16s; }}
+        @keyframes fadeEffectLogin {{
+            0% {{ opacity: 0; }}
+            5% {{ opacity: 1; }}
+            15% {{ opacity: 1; }}
+            20% {{ opacity: 0; }}
+            100% {{ opacity: 0; }}
+        }}
+    </style>
+    <div class="login-slideshow-container">
+        <img class="slide-image" src="{image_urls[0]}" alt="Dynamic Cake Image 1">
+        <img class="slide-image" src="{image_urls[1]}" alt="Dynamic Cake Image 2">
+        <img class="slide-image" src="{image_urls[2]}" alt="Dynamic Cake Image 3">
+        <img class="slide-image" src="{image_urls[3]}" alt="Dynamic Cake Image 4">
+        <img class="slide-image" src="{image_urls[4]}" alt="Dynamic Cake Image 5">
+    </div>
+    """
+    st.markdown(slideshow_html, unsafe_allow_html=True)
+
+def add_sidebar_cake_slideshow():
+    """Injects HTML and CSS for a dynamic cake image slideshow in the sidebar."""
+    
+    # Randomly select 5 unique images from the curated list
+    image_urls = random.sample(CAKE_IMAGE_URLS, 5)
+
+    slideshow_html = f"""
+    <style>
+        .sidebar-slideshow-container {{
+            width: 100%; /* Fit to sidebar width */
+            position: relative;
+            margin: 15px auto; /* Adjusted margin for sidebar */
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 8px 0 rgba(0,0,0,0.2);
+            height: 250px; /* Adjusted height for sidebar */
+        }}
+
+        .sidebar-slideshow-container .slide-image {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 0;
+            animation: fadeEffectSidebar 20s infinite;
+        }}
+
+        /* Animation delays for each image */
+        .sidebar-slideshow-container .slide-image:nth-child(1) {{ animation-delay: 0s; }}
+        .sidebar-slideshow-container .slide-image:nth-child(2) {{ animation-delay: 4s; }}
+        .sidebar-slideshow-container .slide-image:nth-child(3) {{ animation-delay: 8s; }}
+        .sidebar-slideshow-container .slide-image:nth-child(4) {{ animation-delay: 12s; }}
+        .sidebar-slideshow-container .slide-image:nth-child(5) {{ animation-delay: 16s; }}
+
+        @keyframes fadeEffectSidebar {{
+            0% {{ opacity: 0; }}
+            5% {{ opacity: 1; }}
+            15% {{ opacity: 1; }}
+            20% {{ opacity: 0; }}
+            100% {{ opacity: 0; }}
+        }}
+    </style>
+
+    <div class="sidebar-slideshow-container">
+        <img class="slide-image" src="{image_urls[0]}" alt="Dynamic Cake Image 1">
+        <img class="slide-image" src="{image_urls[1]}" alt="Dynamic Cake Image 2">
+        <img class="slide-image" src="{image_urls[2]}" alt="Dynamic Cake Image 3">
+        <img class="slide-image" src="{image_urls[3]}" alt="Dynamic Cake Image 4">
+        <img class="slide-image" src="{image_urls[4]}" alt="Dynamic Cake Image 5">
+    </div>
+    """
+    st.markdown(slideshow_html, unsafe_allow_html=True)
+
+
 if 'user_id' not in st.session_state:
     st.session_state.user_id = None
 if 'is_admin' not in st.session_state:
@@ -495,8 +677,6 @@ if 'is_admin' not in st.session_state:
 if 'email' not in st.session_state:
     st.session_state.email = None
 
-
-# --- Sidebar UI ---
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, use_container_width=True)
@@ -512,6 +692,12 @@ with st.sidebar:
             with st.spinner(logout_message):
                 st.session_state.clear()
             st.rerun()
+        
+        st.markdown("---")
+        st.markdown('<a href="https://katrina-knowledgebase.streamlit.app/" target="_blank" style="display: inline-block; text-align: center; width: 100%; padding: 7px; background-color: #ff1493; color: white; border-radius: 5px; text-decoration: none; font-weight: bold;">Find nearest store</a>', unsafe_allow_html=True)
+        
+        # Add the slideshow to the user sidebar
+        add_sidebar_cake_slideshow()
 
     elif st.session_state.is_admin:
         st.markdown("<h2 style='text-align: center;'>Admin Portal</h2>", unsafe_allow_html=True)
@@ -571,13 +757,20 @@ with st.sidebar:
                                 combined_text = f"Image Description: {image_description}\n\nText found in image: {ocr_text}"
                                 chunks = text_chunker(combined_text)
                                 if combined_text.strip(): image_data = base64.b64encode(original_bytes).decode('utf-8')
-                            elif ext == "pdf": chunks = text_chunker(extract_text_from_pdf(io.BytesIO(original_bytes)))
-                            elif ext in ["txt", "csv"]: chunks = text_chunker(original_bytes.decode("utf-8"))
-                            elif ext == "xlsx": chunks = get_structured_chunks_from_xlsx(io.BytesIO(original_bytes))
-                            elif ext == "docx": chunks = text_chunker(extract_text_from_docx(io.BytesIO(original_bytes)))
+                            elif ext == "pdf": 
+                                extracted_text = extract_text_from_pdf(io.BytesIO(original_bytes))
+                                chunks = text_chunker(extracted_text)
+                            elif ext in ["txt", "csv"]: 
+                                extracted_text = original_bytes.decode("utf-8")
+                                chunks = text_chunker(extracted_text)
+                            elif ext == "xlsx": 
+                                chunks = get_structured_chunks_from_xlsx(io.BytesIO(original_bytes))
+                            elif ext == "docx": 
+                                extracted_text = extract_text_from_docx(io.BytesIO(original_bytes))
+                                chunks = text_chunker(extracted_text)
                             
                             if chunks:
-                                with st.spinner("Adding document to knowledge base..."):
+                                with st.spinner(f"Processing {len(chunks)} chunks..."):
                                     create_document_with_embedding(title, title, chunks, ext, image_data, original_file_bytes=original_bytes)
                         else:
                             st.warning("Please choose a file to upload.")
@@ -644,18 +837,27 @@ with st.sidebar:
                 
                 if login_successful:
                     st.rerun()
+        add_sidebar_cake_slideshow()
 
-# --- Main App Logic ---
+
+# --- App Header ---
 logo_base_64 = get_image_as_base64(LOGO_PATH)
 if logo_base_64:
-    st.markdown(f"""<div style="display: flex; align-items: center; justify-content: center;"><img src="data:image/png;base64,{logo_base_64}" alt="Logo" style="height: 50px; margin-right: 15px;"><h1 style='color: #ff1493; margin: 0;'><b>Katrina Knowledgebase 🎂</b></h1></div>""", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="custom-header">
+        <div class="header-content">
+            <img src="data:image/png;base64,{logo_base_64}" alt="Logo" style="height: 60px;">
+            <h1><b>Katrina Knowledgebase 🎂</b></h1>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 else:
-    st.markdown("<h1 style='text-align: center; color: #ff1493;'><b>Katrina Knowledgebase 🎂</b></h1>", unsafe_allow_html=True)
-st.markdown("---")
+    st.markdown("<div class='custom-header'><h1><b>Katrina Knowledgebase 🎂</b></h1></div>", unsafe_allow_html=True)
+
 
 if st.session_state.user_id:
     if st.session_state.is_admin:
-        st.info("Welcome, Admin. Please use the sidebar to manage users and the knowledge base.")
+        st.markdown("<h4 style='text-align: center;'>Welcome, Admin. Please use the sidebar to manage users and the knowledge base.</h4>", unsafe_allow_html=True)
     else:
         if 'welcome_message_shown' not in st.session_state:
             st.toast(f"Welcome to the Katrina Knowledgebase, {st.session_state.email}!", icon="🎂")
@@ -665,10 +867,6 @@ if st.session_state.user_id:
 
         with chat_col:
             st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-            
-            # --- New, Simplified Workflow ---
-            if 'search_query' not in st.session_state:
-                st.session_state.search_query = None
             
             # --- Search Input Handling ---
             with st.form("image_upload_form", clear_on_submit=True):
@@ -681,61 +879,118 @@ if st.session_state.user_id:
                 clear_search()
                 st.rerun()
             
-            # --- Process input and update state before the rest of the script runs ---
+            # --- Refactored Search Initiation Logic ---
+            search_initiated = False
             if submitted_image and uploaded_image:
-                img = Image.open(uploaded_image)
-                st.session_state.search_query = get_image_description(img)
-                st.session_state.search_image = img
-                st.rerun()
-            
+                with st.spinner("Analyzing image..."):
+                    img = Image.open(uploaded_image)
+                    st.session_state.search_query = get_image_description(img)
+                    st.session_state.search_image = img
+                    search_initiated = True
             elif prompt:
                 st.session_state.search_query = prompt
-                st.session_state.search_image = None
+                st.session_state.search_image = None # Ensure no old image persists
+                search_initiated = True
+
+            if search_initiated:
+                st.session_state.page_number = 0
+                # Clear previous results to trigger a new search on rerun
+                if 'search_results' in st.session_state:
+                    del st.session_state['search_results']
+                if 'external_info' in st.session_state:
+                    del st.session_state['external_info']
                 st.rerun()
 
-            # --- Display Logic: Only runs if a search has been completed ---
-            if st.session_state.search_query:
+
+            # --- Display Search Results ---
+            if st.session_state.get('search_query'):
+                if 'page_number' not in st.session_state:
+                    st.session_state.page_number = 0
+
                 search_query = st.session_state.search_query
                 uploaded_image_obj = st.session_state.get('search_image')
+                
+                # OPTIMIZATION: Only run the search if results are not already in session state
+                if 'search_results' not in st.session_state:
+                    with st.spinner("Thinking..."):
+                        intelligent_query = get_intelligent_search_query(search_query)
+                        query_embedding = get_query_embedding(intelligent_query)
+                        external_info = get_external_information(intelligent_query)
+                        retrieved_docs = get_similar_documents(query_embedding)
+                        if not retrieved_docs:
+                            retrieved_docs = fallback_keyword_search(intelligent_query)
+                        
+                        st.session_state.search_results = retrieved_docs
+                        st.session_state.external_info = external_info
+                
+                retrieved_docs = st.session_state.search_results
+                external_info = st.session_state.external_info
 
-                with st.spinner("Thinking..."):
-                    intelligent_query = get_intelligent_search_query(search_query)
-                    query_embedding = get_embedding(intelligent_query)
-                    external_info = get_external_information(intelligent_query)
-                    retrieved_docs = get_similar_documents(query_embedding)
-                    if not retrieved_docs:
-                        retrieved_docs = fallback_keyword_search(intelligent_query)
-                    
-                    suggestion = get_spelling_suggestion(search_query)
-                    if suggestion.lower() == search_query.lower():
-                        suggestion = None
-
-                # Display the user's query and the assistant's response
                 with st.chat_message("user"):
                     if uploaded_image_obj:
                         st.image(uploaded_image_obj, caption="User Upload")
                     st.markdown(search_query)
                 
                 with st.chat_message("assistant"):
-                    if suggestion:
-                         if st.button(f"Did you mean: **{suggestion}**?"):
-                            st.session_state.search_query = suggestion
-                            st.session_state.search_image = None
-                            st.rerun()
+                    if st.session_state.page_number == 0:
+                        suggestion = get_spelling_suggestion(search_query)
+                        if suggestion and suggestion.lower() != search_query.lower():
+                            if st.button(f"Did you mean: **{suggestion}**?"):
+                                clear_search()
+                                st.session_state.search_query = suggestion
+                                st.session_state.page_number = 0
+                                st.rerun()
                     
-                    for doc in retrieved_docs:
-                        with st.expander(f"Result: {doc.get('title', 'Untitled')}", expanded=True):
-                            if 'image_data' in doc:
-                                st.image(base64.b64decode(doc['image_data']), width=500)
-                            if 'download_url' in doc and doc['download_url']:
-                                st.markdown(f"[{doc['filename']}]({doc['download_url']}) ⬇️")
+                    results_per_page = 5
+                    start_index = st.session_state.page_number * results_per_page
+                    end_index = start_index + results_per_page
                     
-                    response_stream = get_conversational_response_stream(search_query, retrieved_docs, external_info)
+                    docs_to_display = retrieved_docs[start_index:end_index]
+
+                    # Generate a new response for the current page
+                    response_stream = get_conversational_response_stream(search_query, docs_to_display, external_info)
                     st.write_stream(response_stream)
-            
+
+                    st.markdown("---")
+                    
+                    for doc in docs_to_display:
+                        with st.expander(f"Source: {doc.get('title', 'Untitled')}", expanded=False):
+                            if doc.get('image_data') and doc.get('download_url'):
+                                img_src = f"data:image/png;base64,{doc['image_data']}"
+                                download_url = doc['download_url']
+                                st.markdown(f"""
+                                    <a href="{download_url}" target="_blank" title="Click to open full-size image in a new tab">
+                                        <img src="{img_src}" style="width: 100%; max-width: 500px; cursor: pointer;">
+                                    </a>
+                                """, unsafe_allow_html=True)
+                                st.write(doc.get('chunk_text', ''))
+
+                            elif doc.get('download_url'):
+                                st.markdown(f"**Filename:** [{doc['filename']}]({doc['download_url']}) ⬇️")
+                                st.write(doc.get('chunk_text', ''))
+
+
+                    total_results = len(retrieved_docs)
+                    total_pages = math.ceil(total_results / results_per_page)
+
+                    if total_pages > 1:
+                        prev_col, page_col, next_col = st.columns([1, 2, 1])
+                        with prev_col:
+                            if st.button("⬅️ Previous", disabled=(st.session_state.page_number == 0)):
+                                st.session_state.page_number -= 1
+                                st.rerun()
+                        with page_col:
+                            st.markdown(f"<div style='text-align: center;'>Page {st.session_state.page_number + 1} of {total_pages}</div>", unsafe_allow_html=True)
+                        with next_col:
+                            if st.button("Next ➡️", disabled=(end_index >= total_results)):
+                                st.session_state.page_number += 1
+                                st.rerun()
+
             st.markdown('</div>', unsafe_allow_html=True)
 else:
-    st.info("Please log in using the sidebar to start.")
-
+    # --- Centered and Pink Login Message ---
+    st.markdown("<h3 style='text-align: center; color: #ff1493;'>Please log in using the sidebar to start using Katrina Assistant</h3>", unsafe_allow_html=True)
+    add_login_page_cake_slideshow()
+    
 st.markdown('<div class="footer">Katrina Knowledgebase by Judy Sepe</div>', unsafe_allow_html=True)
 
