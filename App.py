@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore as fa_firestore
@@ -49,12 +50,8 @@ st.markdown("""
     
     /* --- Modern, Interactive Header --- */
     .custom-header {
-        background: #FFFFFF; /* White Background */
-        padding: 2.5rem; /* Increased padding for more height */
-        border-radius: 15px;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-        margin-bottom: 0; /* Removed bottom margin */
-        border-bottom: 1px solid #F0F2F6; /* Subtle border for separation */
+        padding: 2.5rem; /* Spacing for the header content */
+        margin-bottom: 0;
     }
     
     .header-content {
@@ -564,12 +561,32 @@ CAKE_IMAGE_URLS = [
     "https://images.pexels.com/photos/1721934/pexels-photo-1721934.jpeg?auto=compress&cs=tinysrgb&w=600",
     "https://images.pexels.com/photos/827516/pexels-photo-827516.jpeg?auto=compress&cs=tinysrgb&w=600",
     "https://images.pexels.com/photos/461431/pexels-photo-461431.jpeg?auto=compress&cs=tinysrgb&w=600",
-    "https://images.pexels.com/photos/210537/pexels-photo-210537.jpeg?auto=compress&cs=tinysrgb&w=600"
+    "https://images.pexels.com/photos/210537/pexels-photo-210537.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1854652/pexels-photo-1854652.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/2144112/pexels-photo-2144112.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1028704/pexels-photo-1028704.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1414234/pexels-photo-1414234.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/7440460/pexels-photo-7440460.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/65027/pexels-photo-65027.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/3025236/pexels-photo-3025236.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/258207/pexels-photo-258207.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1120668/pexels-photo-1120668.jpeg?auto=compress&cs=tinysrgb&w=600",
+    "https://images.pexels.com/photos/1028741/pexels-photo-1028741.jpeg?auto=compress&cs=tinysrgb&w=600"
 ]
 
 def add_login_page_cake_slideshow():
     """Injects HTML and CSS for a dynamic cake image slideshow on the login page."""
-    image_urls = random.sample(CAKE_IMAGE_URLS, 5)
+    image_urls = random.sample(CAKE_IMAGE_URLS, 20)
+    
+    # Generate CSS for animation delays and image tags dynamically
+    animation_delay_css = ""
+    img_tags = ""
+    total_duration = 80 # 4 seconds per image * 20 images
+    for i in range(20):
+        delay = i * 4
+        animation_delay_css += f".login-slideshow-container .slide-image:nth-child({i+1}) {{ animation-delay: {delay}s; }}\n"
+        img_tags += f'<img class="slide-image" src="{image_urls[i]}" alt="Dynamic Cake Image {i+1}">'
+
     slideshow_html = f"""
     <style>
         .login-slideshow-container {{
@@ -589,36 +606,36 @@ def add_login_page_cake_slideshow():
             height: 100%;
             object-fit: cover;
             opacity: 0;
-            animation: fadeEffectLogin 20s infinite;
+            animation: fadeEffectLogin {total_duration}s infinite;
         }}
-        .login-slideshow-container .slide-image:nth-child(1) {{ animation-delay: 0s; }}
-        .login-slideshow-container .slide-image:nth-child(2) {{ animation-delay: 4s; }}
-        .login-slideshow-container .slide-image:nth-child(3) {{ animation-delay: 8s; }}
-        .login-slideshow-container .slide-image:nth-child(4) {{ animation-delay: 12s; }}
-        .login-slideshow-container .slide-image:nth-child(5) {{ animation-delay: 16s; }}
+        {animation_delay_css}
         @keyframes fadeEffectLogin {{
             0% {{ opacity: 0; }}
-            5% {{ opacity: 1; }}
-            15% {{ opacity: 1; }}
-            20% {{ opacity: 0; }}
+            0.5% {{ opacity: 1; }}
+            4% {{ opacity: 1; }}
+            5% {{ opacity: 0; }}
             100% {{ opacity: 0; }}
         }}
     </style>
     <div class="login-slideshow-container">
-        <img class="slide-image" src="{image_urls[0]}" alt="Dynamic Cake Image 1">
-        <img class="slide-image" src="{image_urls[1]}" alt="Dynamic Cake Image 2">
-        <img class="slide-image" src="{image_urls[2]}" alt="Dynamic Cake Image 3">
-        <img class="slide-image" src="{image_urls[3]}" alt="Dynamic Cake Image 4">
-        <img class="slide-image" src="{image_urls[4]}" alt="Dynamic Cake Image 5">
+        {img_tags}
     </div>
     """
-    st.markdown(slideshow_html, unsafe_allow_html=True)
+    components.html(slideshow_html, height=425)
 
 def add_sidebar_cake_slideshow():
     """Injects HTML and CSS for a dynamic cake image slideshow in the sidebar."""
     
-    # Randomly select 5 unique images from the curated list
-    image_urls = random.sample(CAKE_IMAGE_URLS, 5)
+    image_urls = random.sample(CAKE_IMAGE_URLS, 20)
+    
+    # Generate CSS for animation delays and image tags dynamically
+    animation_delay_css = ""
+    img_tags = ""
+    total_duration = 80 # 4 seconds per image * 20 images
+    for i in range(20):
+        delay = i * 4
+        animation_delay_css += f".sidebar-slideshow-container .slide-image:nth-child({i+1}) {{ animation-delay: {delay}s; }}\n"
+        img_tags += f'<img class="slide-image" src="{image_urls[i]}" alt="Dynamic Cake Image {i+1}">'
 
     slideshow_html = f"""
     <style>
@@ -640,34 +657,25 @@ def add_sidebar_cake_slideshow():
             height: 100%;
             object-fit: cover;
             opacity: 0;
-            animation: fadeEffectSidebar 20s infinite;
+            animation: fadeEffectSidebar {total_duration}s infinite;
         }}
 
-        /* Animation delays for each image */
-        .sidebar-slideshow-container .slide-image:nth-child(1) {{ animation-delay: 0s; }}
-        .sidebar-slideshow-container .slide-image:nth-child(2) {{ animation-delay: 4s; }}
-        .sidebar-slideshow-container .slide-image:nth-child(3) {{ animation-delay: 8s; }}
-        .sidebar-slideshow-container .slide-image:nth-child(4) {{ animation-delay: 12s; }}
-        .sidebar-slideshow-container .slide-image:nth-child(5) {{ animation-delay: 16s; }}
+        {animation_delay_css}
 
         @keyframes fadeEffectSidebar {{
             0% {{ opacity: 0; }}
-            5% {{ opacity: 1; }}
-            15% {{ opacity: 1; }}
-            20% {{ opacity: 0; }}
+            0.5% {{ opacity: 1; }}
+            4% {{ opacity: 1; }}
+            5% {{ opacity: 0; }}
             100% {{ opacity: 0; }}
         }}
     </style>
 
     <div class="sidebar-slideshow-container">
-        <img class="slide-image" src="{image_urls[0]}" alt="Dynamic Cake Image 1">
-        <img class="slide-image" src="{image_urls[1]}" alt="Dynamic Cake Image 2">
-        <img class="slide-image" src="{image_urls[2]}" alt="Dynamic Cake Image 3">
-        <img class="slide-image" src="{image_urls[3]}" alt="Dynamic Cake Image 4">
-        <img class="slide-image" src="{image_urls[4]}" alt="Dynamic Cake Image 5">
+        {img_tags}
     </div>
     """
-    st.markdown(slideshow_html, unsafe_allow_html=True)
+    components.html(slideshow_html, height=275)
 
 
 if 'user_id' not in st.session_state:
